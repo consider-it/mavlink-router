@@ -47,11 +47,12 @@ struct UartEndpointConfig {
 };
 
 struct UdpEndpointConfig {
-    enum class Mode { Undefined = 0, Server, Client };
+    enum class Mode { Undefined = 0, Server, Client, Fixed };
 
     std::string name;
     std::string address;
     unsigned long port;
+    std::string target_address;
     Mode mode;
     std::vector<uint32_t> allow_msg_id_out;
     std::vector<uint8_t> allow_src_comp_out;
@@ -253,9 +254,12 @@ public:
 
 protected:
     bool open(const char *ip, unsigned long port,
-              UdpEndpointConfig::Mode mode = UdpEndpointConfig::Mode::Client);
-    int open_ipv4(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode);
-    int open_ipv6(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode);
+              UdpEndpointConfig::Mode mode = UdpEndpointConfig::Mode::Client,
+              const std::string target_ip = "");
+    int open_ipv4(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode,
+                  const std::string target_ip);
+    int open_ipv6(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode,
+                  const std::string target_ip);
 
     ssize_t _read_msg(uint8_t *buf, size_t len) override;
 
@@ -264,13 +268,21 @@ protected:
         struct sockaddr_in6 v6;
     } config_sock;
 
+    union {
+        struct sockaddr_in v4;
+        struct sockaddr_in6 v6;
+    } config_sock_out;
+
     Timeout *nomessage_timeout = nullptr;
     bool _nomessage_timeout_cb(void *data);
 
 private:
     bool is_ipv6;
+    bool fixed_target_ip;
     struct sockaddr_in sockaddr;
     struct sockaddr_in6 sockaddr6;
+    struct sockaddr_in sockaddr_out;
+    struct sockaddr_in6 sockaddr6_out;
 };
 
 class TcpEndpoint : public Endpoint {

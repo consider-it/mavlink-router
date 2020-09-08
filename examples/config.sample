@@ -140,7 +140,7 @@ Baud = 52000
 
 # Mode of operation. See the readme for a detailed description of the endpoint
 # behavior (client mode is <normal> in the configuraiton).
-# Valid values: <normal>, <server>
+# Valid values: <normal>, <server>, <fixed>
 # Mandatory, no default value
 #Mode = 
 
@@ -155,6 +155,15 @@ Baud = 52000
 # Optional in <normal> mode, will select the next port not used by mavlink-router
 #   starting from 14550 when not speciifed.
 #Port = 
+
+# Static target IP address for "fixed" mode.
+# The Address parameter must contain the binding address (as in "server" mode)
+# while this parameter can contain a broadcast/ multicast address which will be
+# kept as target address regardless of "connecting" clients.
+# When using a link-local IPv6 address or a IPv6 multicast group, the binding
+# address **must** be an interfaces's link-local address!
+# Mandatory in <fixed> mode only.
+#TargetAddress = 
 
 # See description at UartEndpoint
 #AllowMsgIdOut = 

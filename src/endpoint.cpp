@@ -71,6 +71,7 @@ const ConfFile::OptionsTable UdpEndpoint::option_table[] = {
     {"address",         true,   ConfFile::parse_stdstring,      OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, address)},
     {"mode",            true,   UdpEndpoint::parse_udp_mode,    OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, mode)},
     {"port",            false,  ConfFile::parse_ul,             OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, port)},
+    {"targetaddress",   false,  ConfFile::parse_stdstring,      OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, target_address)},
     {"filter",          false,  ConfFile::parse_uint32_vector,  OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, allow_msg_id_out)}, // legacy AllowMsgIdOut
     {"AllowMsgIdOut",   false,  ConfFile::parse_uint32_vector,  OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, allow_msg_id_out)},
     {"AllowSrcCompOut", false,  ConfFile::parse_uint8_vector,   OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, allow_src_comp_out)},
@@ -106,6 +107,16 @@ static bool ipv6_is_multicast(const char *ip)
 {
     /* multicast addresses start with ff0x (most of the time) */
     return strncmp(ip, "ff0", 3) == 0;
+}
+
+static bool ipv4_is_multicast(const char *ip)
+{
+    /* multicast addresses start with 224 to 239 */
+    int ipFirstByte = atoi(ip);
+    if (224 <= ipFirstByte && ipFirstByte <= 239) {
+        return true;
+    }
+    return false;
 }
 
 static bool validate_ipv6(const std::string &ip)
@@ -961,6 +972,8 @@ UdpEndpoint::UdpEndpoint(std::string name)
 {
     bzero(&sockaddr, sizeof(sockaddr));
     bzero(&sockaddr6, sizeof(sockaddr6));
+    bzero(&sockaddr_out, sizeof(sockaddr_out));
+    bzero(&sockaddr6_out, sizeof(sockaddr6_out));
 }
 
 UdpEndpoint::~UdpEndpoint()
@@ -976,7 +989,7 @@ bool UdpEndpoint::setup(UdpEndpointConfig conf)
         return false;
     }
 
-    if (!this->open(conf.address.c_str(), conf.port, conf.mode)) {
+    if (!this->open(conf.address.c_str(), conf.port, conf.mode, conf.target_address)) {
         log_error("Could not open %s:%ld", conf.address.c_str(), conf.port);
         return false;
     }
@@ -994,7 +1007,8 @@ bool UdpEndpoint::setup(UdpEndpointConfig conf)
     return true;
 }
 
-int UdpEndpoint::open_ipv6(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode)
+int UdpEndpoint::open_ipv6(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode,
+                           const std::string target_ip)
 {
     fd = socket(AF_INET6, SOCK_DGRAM, 0);
     if (fd < 0) {
@@ -1006,6 +1020,19 @@ int UdpEndpoint::open_ipv6(const char *ip, unsigned long port, UdpEndpointConfig
     char *ip_str = strdup(&ip[1]);
     ip_str[strlen(ip_str) - 1] = '\0';
 
+    /* do some more input validation for multicast mode */
+    char *target_ip_str = nullptr;
+    if (mode == UdpEndpointConfig::Mode::Fixed) {
+        target_ip_str = strdup(target_ip.c_str());
+        target_ip_str[strlen(target_ip_str) - 1] = '\0';
+
+        if ((ipv6_is_multicast(target_ip_str) || ipv6_is_linklocal(target_ip_str))
+            && !ipv6_is_linklocal(ip_str)) {
+            log_error("Address must be link local, if targetAddress is multicast or link local!");
+            goto fail;
+        }
+    }
+
     /* remove omittable zeros from IPv6 address */
     sockaddr_in6 ip_addr;
     inet_pton(AF_INET6, ip_str, &ip_addr.sin6_addr);
@@ -1015,15 +1042,27 @@ int UdpEndpoint::open_ipv6(const char *ip, unsigned long port, UdpEndpointConfig
     sockaddr6.sin6_port = htons(port);
 
     /* multicast address needs to listen to all, but "filter" incoming packets */
-    if (mode == UdpEndpointConfig::Mode::Server && ipv6_is_multicast(ip_str)) {
+    if ((mode == UdpEndpointConfig::Mode::Server && ipv6_is_multicast(ip_str))
+        || (mode == UdpEndpointConfig::Mode::Fixed && ipv6_is_multicast(target_ip_str))) {
         sockaddr6.sin6_addr = in6addr_any;
 
         struct ipv6_mreq group;
-        inet_pton(AF_INET6, ip_str, &group.ipv6mr_multiaddr);
+        if (mode == UdpEndpointConfig::Mode::Fixed) {
+            inet_pton(AF_INET6, target_ip_str, &group.ipv6mr_multiaddr);
+        } else {
+            inet_pton(AF_INET6, ip_str, &group.ipv6mr_multiaddr);
+        }
         if (setsockopt(fd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &group, sizeof(group)) < 0) {
             log_error("Error setting IPv6 multicast socket options for [%s]:%lu (%m)",
                       ip_str,
                       port);
+            goto fail;
+        }
+
+        /* disable multicast loopback */
+        bool loopch = false;
+        if (setsockopt(fd, IPPROTO_IP, IPV6_MULTICAST_LOOP, &loopch, sizeof(loopch)) < 0) {
+            log_error("Error disabling IPv6 multicast loop for [%s]:%lu (%m)", ip_str, port);
             goto fail;
         }
     } else {
@@ -1035,7 +1074,12 @@ int UdpEndpoint::open_ipv6(const char *ip, unsigned long port, UdpEndpointConfig
         sockaddr6.sin6_scope_id = ipv6_get_scope_id(ip_str);
     }
 
-    if (mode == UdpEndpointConfig::Mode::Server) {
+    /* for multicast mode: set fixed outgoing address */
+    if (mode == UdpEndpointConfig::Mode::Fixed) {
+        memcpy(&sockaddr6_out, &sockaddr6, sizeof(sockaddr6_out));
+    }
+
+    if (mode == UdpEndpointConfig::Mode::Server || mode == UdpEndpointConfig::Mode::Fixed) {
         if (bind(fd, (struct sockaddr *)&sockaddr6, sizeof(sockaddr6)) < 0) {
             log_error("Error binding IPv6 socket for [%s]:%lu (%m)", ip_str, port);
             goto fail;
@@ -1055,7 +1099,8 @@ fail:
     return -EINVAL;
 }
 
-int UdpEndpoint::open_ipv4(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode)
+int UdpEndpoint::open_ipv4(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode,
+                           const std::string target_ip)
 {
     fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
@@ -1064,10 +1109,41 @@ int UdpEndpoint::open_ipv4(const char *ip, unsigned long port, UdpEndpointConfig
     }
 
     sockaddr.sin_family = AF_INET;
-    sockaddr.sin_addr.s_addr = inet_addr(ip);
     sockaddr.sin_port = htons(port);
 
-    if (mode == UdpEndpointConfig::Mode::Server) {
+    if ((mode == UdpEndpointConfig::Mode::Server && ipv4_is_multicast(ip))
+        || (mode == UdpEndpointConfig::Mode::Fixed && ipv4_is_multicast(target_ip.c_str()))) {
+        sockaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+        struct ip_mreq group {
+        };
+        if (mode == UdpEndpointConfig::Mode::Fixed) {
+            inet_pton(AF_INET, target_ip.c_str(), &group.imr_multiaddr);
+        } else {
+            inet_pton(AF_INET, ip, &group.imr_multiaddr);
+        }
+        group.imr_interface.s_addr = htonl(INADDR_ANY);
+        if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &group, sizeof(group)) < 0) {
+            log_error("Error setting IPv4 multicast socket options TODO-for (%m)");
+            goto fail;
+        }
+
+        /* disable multicast loopback */
+        bool loopch = false;
+        if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loopch, sizeof(loopch)) < 0) {
+            log_error("Error disabling IPv4 multicast loop TODO-for (%m)");
+            goto fail;
+        }
+    } else {
+        sockaddr.sin_addr.s_addr = inet_addr(ip);
+    }
+
+    /* for multicast mode: set fixed outgoing address */
+    if (mode == UdpEndpointConfig::Mode::Fixed) {
+        memcpy(&sockaddr_out, &sockaddr, sizeof(sockaddr_out));
+    }
+
+    if (mode == UdpEndpointConfig::Mode::Server || mode == UdpEndpointConfig::Mode::Fixed) {
         if (bind(fd, (struct sockaddr *)&sockaddr, sizeof(sockaddr)) < 0) {
             log_error("Error binding IPv4 socket for %s:%lu (%m)", ip, port);
             goto fail;
@@ -1085,17 +1161,19 @@ fail:
     return -EINVAL;
 }
 
-bool UdpEndpoint::open(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode)
+bool UdpEndpoint::open(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode,
+                       const std::string target_ip)
 {
     const int broadcast_val = 1;
 
     this->is_ipv6 = ip_str_is_ipv6(ip);
+    this->fixed_target_ip = (mode == UdpEndpointConfig::Mode::Fixed);
 
     // setup the special IPv6/IPv4 part
     if (this->is_ipv6) {
-        open_ipv6(ip, port, mode);
+        open_ipv6(ip, port, mode, target_ip);
     } else {
-        open_ipv4(ip, port, mode);
+        open_ipv4(ip, port, mode, target_ip);
     }
 
     if (fd < 0) {
@@ -1121,7 +1199,11 @@ bool UdpEndpoint::open(const char *ip, unsigned long port, UdpEndpointConfig::Mo
         goto fail;
     }
 
-    if (mode == UdpEndpointConfig::Mode::Server) {
+    // TODO: copy target IP to sockaddr_out.sin_addr !?
+
+    if (this->fixed_target_ip) {
+        log_info("Opened UDP Fixed  [%d]%s: %s:%lu to %s", fd, _name.c_str(), ip, port, target_ip);
+    } else if (mode == UdpEndpointConfig::Mode::Server) {
         log_info("Opened UDP Server [%d]%s: %s:%lu", fd, _name.c_str(), ip, port);
     } else {
         log_info("Opened UDP Client [%d]%s: %s:%lu", fd, _name.c_str(), ip, port);
@@ -1204,12 +1286,22 @@ int UdpEndpoint::write_msg(const struct buffer *pbuf)
 
     bool sock_connected = false;
     if (this->is_ipv6) {
-        addrlen = sizeof(sockaddr6);
-        sock = (struct sockaddr *)&sockaddr6;
+        if (this->fixed_target_ip) {
+            addrlen = sizeof(sockaddr6_out);
+            sock = (struct sockaddr *)&sockaddr6_out;
+        } else {
+            addrlen = sizeof(sockaddr6);
+            sock = (struct sockaddr *)&sockaddr6;
+        }
         sock_connected = sockaddr6.sin6_port != 0;
     } else {
-        addrlen = sizeof(sockaddr);
-        sock = (struct sockaddr *)&sockaddr;
+        if (this->fixed_target_ip) {
+            addrlen = sizeof(sockaddr_out);
+            sock = (struct sockaddr *)&sockaddr_out;
+        } else {
+            addrlen = sizeof(sockaddr);
+            sock = (struct sockaddr *)&sockaddr;
+        }
         sock_connected = sockaddr.sin_port != 0;
     }
 
@@ -1268,6 +1360,7 @@ int UdpEndpoint::parse_udp_mode(const char *val, size_t val_len, void *storage, 
         log_error("Unknown 'mode' key: %.*s", (int)val_len, val);
         return -EINVAL;
     }
+    // TODO: add fixed mode
 
     return 0;
 }
@@ -1293,8 +1386,18 @@ bool UdpEndpoint::validate_config(const UdpEndpointConfig &config)
         return false;
     }
 
+    if (config.mode == UdpEndpointConfig::Mode::Fixed) {
+        if (!validate_ip(config.target_address)) {
+            log_error("UdpEndpoint %s: Invalid target IP address %s",
+                      config.name.c_str(),
+                      config.target_address.c_str());
+            return false;
+        }
+    }
+
     if (config.mode != UdpEndpointConfig::Mode::Client
-        && config.mode != UdpEndpointConfig::Mode::Server) {
+        && config.mode != UdpEndpointConfig::Mode::Server
+        && config.mode != UdpEndpointConfig::Mode::Fixed) {
         return false;
     }
 
