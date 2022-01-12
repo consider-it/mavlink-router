@@ -35,6 +35,7 @@ if systemd_system_unit_dir == 'auto'
 endif
 
 dep_gtest = dependency('gtest', main : true, required : false)
+dep_gmock = dependency('gmock', main : true, required : false)
 
 # Additional warnings
 possible_cc_flags = [

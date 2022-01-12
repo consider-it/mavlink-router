@@ -1,6 +1,14 @@
 #include "mainloop.h"
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+class MockEndpoint : public Endpoint {
+public:
+    MOCK_METHOD(int, write_msg, (const struct buffer *pbuf), (override));
+    MOCK_METHOD(int, flush_pending_msgs, (), (override));
+    MOCK_METHOD(ssize_t, _read_msg, (uint8_t * buf, size_t len), (override));
+};
 
 TEST(MainLoopTest, termination)
 {

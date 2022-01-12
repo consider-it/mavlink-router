@@ -24,7 +24,7 @@ exe_mavlink_router = executable('mavlink-routerd',
         install: true,
 )
 
-if dep_gtest.found()
+if dep_gtest.found() and dep_gmock.found()
   exe_mainloop_test = executable('mainloop_test',
           [
             'autolog.cpp',
@@ -41,6 +41,7 @@ if dep_gtest.found()
           include_directories: [src_inc, mavlink_inc],
           dependencies : [
             dep_gtest,
+            dep_gmock,
             dep_rt,
           ],
           link_with: libcommon_private,
